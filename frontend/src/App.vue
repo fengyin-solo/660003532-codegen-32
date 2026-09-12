@@ -56,10 +56,54 @@
           <div v-else class="text-xs text-green-400 bg-green-900/20 border border-green-700 rounded p-2">✓ 未发现明显性能问题</div>
         </div>
         <div v-if="store.plan" class="bg-slate-800 rounded-lg p-4 border border-slate-700">
-          <h3 class="text-sm font-bold text-slate-400 mb-3">执行计划树</h3>
+          <div class="flex items-center justify-between mb-3">
+            <h3 class="text-sm font-bold text-slate-400">执行计划树</h3>
+            <button v-if="store.parsed?.type === 'SELECT'" @click="store.toggleLearning()"
+              :class="['text-xs px-3 py-1 rounded font-bold transition-colors', store.learningMode ? 'bg-cyan-500 text-slate-900' : 'bg-slate-700 text-cyan-300 hover:bg-slate-600']">
+              {{ store.learningMode ? '■ 退出演示' : '▶ 学习演示模式' }}
+            </button>
+          </div>
+
+          <!-- 学习演示面板 -->
+          <div v-if="store.learningMode && store.currentStep" class="mb-4 rounded-lg border border-cyan-700/60 bg-slate-900/70 overflow-hidden">
+            <!-- 分段高亮的 SQL -->
+            <div class="border-b border-slate-700 p-3">
+              <div class="text-[10px] text-slate-500 mb-1.5">点击任意高亮子句可跳转到对应讲解（← → 键切换步骤）</div>
+              <pre class="text-xs font-mono whitespace-pre-wrap break-words leading-6"><template v-for="(seg, i) in store.sqlSegments" :key="i"><span
+                    v-if="!seg.plain"
+                    @click="store.jumpToSegment(seg.key)"
+                    :title="seg.label"
+                    :class="['rounded px-0.5 cursor-pointer transition-all', store.activeSegmentKeys.has(seg.key) ? 'bg-cyan-500 text-slate-900 font-bold shadow-[0_0_8px_rgba(6,182,212,0.7)]' : 'bg-cyan-900/30 text-cyan-200 hover:bg-cyan-800/50 underline decoration-cyan-700 decoration-dotted underline-offset-2']">{{ seg.text }}</span><span v-else class="text-slate-500">{{ seg.text }}</span></template></pre>
+            </div>
+
+            <!-- 控制条 -->
+            <div class="flex items-center gap-2 px-3 py-2 border-b border-slate-700 bg-slate-800/60">
+              <button @click="store.prevStep()" class="text-xs px-2 py-1 rounded bg-slate-700 hover:bg-slate-600 text-slate-200">← 上一步</button>
+              <button @click="store.toggleAutoplay()" class="text-xs px-2 py-1 rounded bg-cyan-700 hover:bg-cyan-600 text-white font-bold">{{ store.isPlaying ? '⏸ 暂停' : '▶ 自动播放' }}</button>
+              <button @click="store.nextStep()" class="text-xs px-2 py-1 rounded bg-slate-700 hover:bg-slate-600 text-slate-200">下一步 →</button>
+              <span class="text-xs text-slate-400 ml-1">步骤 {{ store.learningStep + 1 }} / {{ store.learningSteps.length }}</span>
+              <span class="text-xs text-cyan-400 ml-auto font-bold">{{ store.currentStep.order }}. {{ store.currentStep.clauseLabel }}</span>
+            </div>
+
+            <!-- 当前步骤讲解 -->
+            <div class="p-3 space-y-2">
+              <pre class="text-xs font-mono whitespace-pre-wrap break-words text-green-300 bg-slate-950/60 rounded p-2 border border-slate-700">{{ store.currentStep.snippet }}</pre>
+              <p class="text-xs leading-5 text-slate-300">{{ store.currentStep.explanation }}</p>
+              <div class="flex flex-wrap gap-1.5 pt-1">
+                <span class="text-[10px] text-slate-500 self-center">对应计划节点：</span>
+                <span v-for="id in store.currentStep.nodeIds" :key="id"
+                  class="text-[10px] px-2 py-0.5 rounded-full bg-cyan-900/50 border border-cyan-600 text-cyan-300">▸ {{ store.nodeLabel(id) }}</span>
+              </div>
+              <div class="flex flex-wrap gap-1 pt-1">
+                <button v-for="(s, i) in store.learningSteps" :key="s.key" @click="store.setLearningStep(i)"
+                  :class="['w-5 h-5 rounded-full text-[10px] font-bold transition-colors', i === store.learningStep ? 'bg-cyan-500 text-slate-900' : 'bg-slate-700 text-slate-400 hover:bg-slate-600']">{{ i + 1 }}</button>
+              </div>
+            </div>
+          </div>
+
           <div class="overflow-x-auto">
             <div class="font-mono text-xs text-slate-300 space-y-1">
-              <PlanNode :node="store.plan" :depth="0" />
+              <PlanNode :node="store.plan" :depth="0" :active-ids="store.activeNodeIds" />
             </div>
           </div>
         </div>
@@ -73,29 +117,46 @@
 </template>
 
 <script setup lang="ts">
-import { ref, watch, onMounted, defineComponent, h } from 'vue'
+import { ref, watch, onMounted, onUnmounted, defineComponent, h } from 'vue'
 import { useSQLStore, SQL_TEMPLATES, SCHEMA_TABLES } from './store/sql'
 
 const store = useSQLStore()
 const erCanvasRef = ref<HTMLCanvasElement | null>(null)
 
 const PlanNode = defineComponent({
-  props: { node: Object, depth: Number },
+  props: { node: Object, depth: Number, activeIds: { type: Set, default: () => new Set<string>() } },
   setup(props) {
     return () => {
       if (!props.node) return null
       const n = props.node as any
-      const indent = '  '.repeat(props.depth || 0)
-      const opColor = n.operation.includes('Scan') ? '#22c55e' : n.operation.includes('Join') ? '#f97316' : n.operation.includes('Sort') ? '#8b5cf6' : '#06b6d4'
-      return h('div', [
-        h('div', { style: `padding-left: ${(props.depth || 0) * 20}px` }, [
+      const depth = props.depth || 0
+      const indent = '  '.repeat(depth)
+      const opColor = n.operation.includes('Scan') ? '#22c55e'
+        : n.operation.includes('Join') || n.operation === 'Nested Loop' ? '#f97316'
+        : n.operation.includes('Sort') ? '#8b5cf6'
+        : n.operation.includes('Aggregate') ? '#ec4899'
+        : n.operation === 'Limit' ? '#eab308'
+        : n.operation === 'Unique' ? '#14b8a6'
+        : '#06b6d4'
+      const active = !!n.id && (props.activeIds as Set<string>).has(n.id)
+      return h('div', {
+        style: 'border-radius:4px',
+        class: active
+          ? 'bg-cyan-500/20 ring-1 ring-cyan-400 shadow-[0_0_10px_rgba(6,182,212,0.4)] transition-all'
+          : 'transition-all',
+        'data-node-id': n.id,
+      }, [
+        h('div', { style: `padding:2px 4px 2px ${depth * 20 + 4}px` }, [
+          active ? h('span', { style: 'color:#22d3ee;font-weight:bold;margin-right:4px' }, '▶') : null,
           h('span', { style: 'color: #475569' }, indent.replace(/\s\s/g, '│ ').replace(/│ $/, '└─')),
           h('span', { style: `color: ${opColor}; font-weight: bold` }, n.operation),
           n.table ? h('span', { style: 'color: #94a3b8' }, ` on ${n.table}`) : null,
           n.index ? h('span', { style: 'color: #eab308' }, ` [${n.index}]`) : null,
           h('span', { style: 'color: #64748b' }, ` cost=${n.cost.toFixed(1)} rows=${n.rows}`),
+          n.filter ? h('div', { style: 'color:#a78bfa;padding-left:12px;font-size:11px' }, `filter: ${n.filter}`) : null,
+          active && n.detail ? h('div', { style: 'color:#67e8f9;padding-left:16px;font-size:11px' }, 'ⓘ ' + n.detail) : null,
         ]),
-        ...(n.children || []).map((child: any) => h(PlanNode, { node: child, depth: (props.depth || 0) + 1 }))
+        ...(n.children || []).map((child: any) => h(PlanNode, { node: child, depth: depth + 1, activeIds: props.activeIds }))
       ])
     }
   }
@@ -163,4 +224,26 @@ function drawER() {
 
 onMounted(() => { store.analyze(); setTimeout(drawER, 200) })
 watch(() => store.parsed, () => setTimeout(drawER, 100), { deep: true })
+
+// 学习模式下：高亮节点自动滚动到可视区域
+watch(() => store.learningStep, () => {
+  if (!store.learningMode) return
+  const id = store.currentStep?.nodeIds[0]
+  if (!id) return
+  requestAnimationFrame(() => {
+    const el = document.querySelector(`[data-node-id="${id}"]`)
+    el?.scrollIntoView({ block: 'nearest', behavior: 'smooth' })
+  })
+})
+
+// 学习模式键盘导航：← 上一步，→ 下一步
+function onKeydown(e: KeyboardEvent) {
+  if (!store.learningMode) return
+  const tag = (e.target as HTMLElement)?.tagName
+  if (tag === 'TEXTAREA' || tag === 'INPUT' || tag === 'SELECT') return
+  if (e.key === 'ArrowRight') { e.preventDefault(); store.nextStep() }
+  else if (e.key === 'ArrowLeft') { e.preventDefault(); store.prevStep() }
+}
+onMounted(() => window.addEventListener('keydown', onKeydown))
+onUnmounted(() => window.removeEventListener('keydown', onKeydown))
 </script>
